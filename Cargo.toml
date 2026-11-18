@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/rustberger", "crates/rustberger-cli", "crates/rustberger-wasm"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+repository = "https://github.com/lucky-edgelord/Rustberger"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
