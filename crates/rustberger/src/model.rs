@@ -8,6 +8,8 @@ use crate::error::Result;
 use crate::kernels::{self, PackedB};
 use crate::marian::{self, Item, TYPE_INTGEMM8};
 
+const POS_CACHE: usize = 256;
+
 pub struct Linear {
     pub w: PackedB,
     pub qa: f32,
@@ -19,7 +21,11 @@ pub struct Linear {
 impl Linear {
     /// `x` is `m x w.k` f32; result is `m x w.n`.
     pub fn apply(&self, x: &[f32], m: usize, scratch: &mut Vec<i8>, out: &mut Vec<f32>) {
-        kernels::quantize(x, m, self.w.k, self.qa, self.w.kp, scratch);
+        {
+            let _q = crate::prof::start(crate::prof::QUANT);
+            kernels::quantize(x, m, self.w.k, self.qa, self.w.kp, scratch);
+        }
+        let _g = crate::prof::start(crate::prof::GEMM);
         #[cfg(feature = "gpu")]
         if m >= crate::gpu::MIN_ROWS {
             if let Some(g) = crate::gpu::get() {
@@ -75,6 +81,7 @@ pub struct Model {
     out_qa: f32,
     out_bias: Vec<f32>,
     freqs: Vec<f32>,
+    pos_table: Vec<f32>,
 }
 
 /// Encoder output for a batch of sentences (concatenated along the token axis).
@@ -201,8 +208,17 @@ impl Model {
 
         let nt = dim / 2;
         let inc = (10000f32).ln() / (nt as f32 - 1.0);
-        let freqs = (0..nt).map(|i| (i as f32 * -inc).exp()).collect();
-        Ok((Model { dim, heads: yml.heads, vocab, enc, dec, emb, emb_q, out_qa, out_bias, freqs }, yml))
+        let freqs: Vec<f32> = (0..nt).map(|i| (i as f32 * -inc).exp()).collect();
+        // sinusoidal position signal for the first POS_CACHE positions (longer ones are computed on demand)
+        let mut pos_table = vec![0f32; POS_CACHE * dim];
+        for p in 0..POS_CACHE {
+            for i in 0..nt {
+                let a = p as f32 * freqs[i];
+                pos_table[p * dim + i] = a.sin();
+                pos_table[p * dim + nt + i] = a.cos();
+            }
+        }
+        Ok((Model { dim, heads: yml.heads, vocab, enc, dec, emb, emb_q, out_qa, out_bias, freqs, pos_table }, yml))
     }
 
     /// Output layer over the full vocabulary or a shortlist of target ids.
@@ -215,7 +231,7 @@ impl Model {
             }
             None => OutputLayer {
                 ids: None,
-                w: PackedB { n: self.emb_q.n, k: self.emb_q.k, kp: self.emb_q.kp, np: self.emb_q.np, data: self.emb_q.data.clone(), qm: self.emb_q.qm },
+                w: self.emb_q.duplicate(),
                 bias: self.out_bias.clone(),
             },
         }
@@ -228,6 +244,12 @@ impl Model {
         for v in x.iter_mut() {
             *v *= scale;
         }
+        if pos < POS_CACHE {
+            for (v, s) in x.iter_mut().zip(&self.pos_table[pos * d..(pos + 1) * d]) {
+                *v += s;
+            }
+            return;
+        }
         for i in 0..nt {
             let a = pos as f32 * self.freqs[i];
             x[i] += a.sin();
@@ -237,6 +259,7 @@ impl Model {
 
     /// Encode a batch of token sequences (each already terminated by EOS).
     pub fn encode(&self, seqs: &[&[u32]]) -> Encoded {
+        let _t = crate::prof::start(crate::prof::ENCODE);
         let d = self.dim;
         let lens: Vec<usize> = seqs.iter().map(|s| s.len()).collect();
         let mut offsets = Vec::with_capacity(seqs.len() + 1);
@@ -264,16 +287,14 @@ impl Model {
             layer.wv.apply(&x, total, &mut scratch, &mut vs);
             for s in 0..seqs.len() {
                 let (a, b) = (offsets[s] * d, offsets[s + 1] * d);
-                attend(&qs[a..b], &ks[a..b], &vs[a..b], lens[s], lens[s], self.heads, d, &mut ctx[a..b], &mut scores);
+                kernels::attend(&qs[a..b], &ks[a..b], &vs[a..b], lens[s], lens[s], self.heads, d, &mut ctx[a..b], &mut scores);
             }
             layer.wo.apply(&ctx, total, &mut scratch, &mut tmp);
             add_residual_ln(&mut tmp, &x, d, &layer.ln_att);
             std::mem::swap(&mut x, &mut tmp);
 
             layer.w1.apply(&x, total, &mut scratch, &mut tmp);
-            for v in tmp.iter_mut() {
-                *v = v.max(0.0);
-            }
+            kernels::relu_inplace(&mut tmp);
             let mut h2 = Vec::new();
             layer.w2.apply(&tmp, total, &mut scratch, &mut h2);
             add_residual_ln(&mut h2, &x, d, &layer.ln_ffn);
@@ -302,6 +323,7 @@ impl Model {
     /// `rows x state_size` SSRU states (updated in place). Returns log-probabilities
     /// `rows x out.width()`.
     pub fn step(&self, enc: &Encoded, out: &OutputLayer, prev: &[Option<u32>], pos: &[usize], sent: &[usize], cells: &mut [f32]) -> Vec<f32> {
+        let _t = crate::prof::start(crate::prof::DEC_LAYERS);
         let d = self.dim;
         let r = prev.len();
         let ss = self.state_size();
@@ -324,12 +346,7 @@ impl Model {
             let mut o = vec![0f32; r * d];
             for i in 0..r {
                 let c = &mut cells[i * ss + li * d..i * ss + (li + 1) * d];
-                for j in 0..d {
-                    let s = kernels::sigmoid(f[i * d + j]);
-                    let nc = s * c[j] + (1.0 - s) * xw[i * d + j];
-                    c[j] = nc;
-                    o[i * d + j] = nc.max(0.0);
-                }
+                kernels::ssru_gate(&f[i * d..(i + 1) * d], &xw[i * d..(i + 1) * d], c, &mut o[i * d..(i + 1) * d]);
             }
             add_residual_ln(&mut o, &x, d, &layer.ln_rnn);
             x = o;
@@ -339,16 +356,14 @@ impl Model {
             for i in 0..r {
                 let s = sent[i];
                 let (a, b) = (enc.offsets[s] * d, enc.offsets[s + 1] * d);
-                attend(&q[i * d..(i + 1) * d], &enc.cross_k[li][a..b], &enc.cross_v[li][a..b], 1, enc.lens[s], self.heads, d, &mut ctx[i * d..(i + 1) * d], &mut scores);
+                kernels::attend(&q[i * d..(i + 1) * d], &enc.cross_k[li][a..b], &enc.cross_v[li][a..b], 1, enc.lens[s], self.heads, d, &mut ctx[i * d..(i + 1) * d], &mut scores);
             }
             layer.co.apply(&ctx, r, &mut scratch, &mut tmp);
             add_residual_ln(&mut tmp, &x, d, &layer.ln_ctx);
             std::mem::swap(&mut x, &mut tmp);
 
             layer.w1.apply(&x, r, &mut scratch, &mut tmp);
-            for v in tmp.iter_mut() {
-                *v = v.max(0.0);
-            }
+            kernels::relu_inplace(&mut tmp);
             let mut h2 = Vec::new();
             layer.w2.apply(&tmp, r, &mut scratch, &mut h2);
             add_residual_ln(&mut h2, &x, d, &layer.ln_ffn);
@@ -356,48 +371,18 @@ impl Model {
         }
 
         // output projection (tied embeddings) + log-softmax
+        drop(_t);
+        let _t = crate::prof::start(crate::prof::DEC_LOGITS);
         kernels::quantize(&x, r, d, self.out_qa, out.w.kp, &mut scratch);
         let n = out.w.n;
         let mut logits = vec![0f32; r * n];
         kernels::gemm(&scratch, r, &out.w, self.out_qa, Some(&out.bias), &mut logits);
-        for row in logits.chunks_exact_mut(n) {
-            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let lse = row.iter().map(|v| (v - mx).exp()).sum::<f32>().ln() + mx;
-            for v in row.iter_mut() {
-                *v -= lse;
-            }
-        }
+        kernels::log_softmax_rows(&mut logits, n);
         logits
     }
 }
 
 /// out = LayerNorm(out + residual)
 fn add_residual_ln(out: &mut [f32], residual: &[f32], dim: usize, ln: &Ln) {
-    for (o, r) in out.iter_mut().zip(residual) {
-        *o += r;
-    }
-    kernels::layer_norm(out, dim, &ln.g, &ln.b);
-}
-
-/// Multi-head scaled dot-product attention; `q` is `tq x dim`, `k`/`v` are `tk x dim`.
-#[allow(clippy::too_many_arguments)]
-fn attend(q: &[f32], k: &[f32], v: &[f32], tq: usize, tk: usize, heads: usize, dim: usize, out: &mut [f32], scores: &mut Vec<f32>) {
-    let dk = dim / heads;
-    let scale = 1.0 / (dk as f32).sqrt();
-    scores.clear();
-    scores.resize(tk, 0.0);
-    for t in 0..tq {
-        for h in 0..heads {
-            let qh = &q[t * dim + h * dk..t * dim + (h + 1) * dk];
-            for j in 0..tk {
-                scores[j] = kernels::dot_f32(qh, &k[j * dim + h * dk..j * dim + (h + 1) * dk]) * scale;
-            }
-            kernels::softmax_inplace(scores);
-            let o = &mut out[t * dim + h * dk..t * dim + (h + 1) * dk];
-            o.fill(0.0);
-            for j in 0..tk {
-                kernels::axpy(scores[j], &v[j * dim + h * dk..j * dim + (h + 1) * dk], o);
-            }
-        }
-    }
+    kernels::add_layer_norm(out, residual, dim, &ln.g, &ln.b);
 }

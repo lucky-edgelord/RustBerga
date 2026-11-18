@@ -18,6 +18,7 @@ struct Sent {
 
 /// Decode every sentence of `enc`. Returns target token ids (EOS stripped) per sentence.
 pub fn decode(model: &Model, enc: &Encoded, out: &OutputLayer, eos: u32, opts: &Options) -> Vec<Vec<u32>> {
+    let _t = crate::prof::start(crate::prof::SEARCH);
     let n = enc.lens.len();
     let beam = opts.beam_size.max(1);
     let ss = model.state_size();

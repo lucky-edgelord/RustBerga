@@ -5,6 +5,8 @@
 //!   C   = (A_q . B_q) / (qa * qb) + bias
 //! Exact i32 accumulation is used, so results are deterministic across ISAs.
 
+mod dot4;
+mod fmath;
 mod scalar;
 #[cfg(target_arch = "aarch64")]
 mod neon;
@@ -14,6 +16,10 @@ mod wasm;
 mod x86;
 
 /// Weight matrix `[N][K]` (K padded with zeros to a multiple of 32, N padded to a multiple of 4).
+///
+/// On AVX512-VNNI and ARM dot-product machines an additional interleaved copy is kept (`il`):
+/// groups of 16 (x86) or 4 (ARM) columns with 4 consecutive k per column, so one dot-product
+/// instruction yields several output columns without horizontal sums.
 pub struct PackedB {
     pub n: usize,
     pub k: usize,
@@ -21,6 +27,10 @@ pub struct PackedB {
     pub np: usize,
     pub data: Vec<i8>,
     pub qm: f32,
+    pub il: Vec<i8>,
+    /// Columns per interleaved group (16 = AVX512-VNNI, 4 = ARM sdot, 0 = no interleaved copy).
+    pub il_group: usize,
+    pub colsum: Vec<i32>,
 }
 
 pub const KALIGN: usize = 32;
@@ -38,7 +48,44 @@ impl PackedB {
         for r in 0..n {
             d[r * kp..r * kp + k].copy_from_slice(&data[r * k..(r + 1) * k]);
         }
-        PackedB { n, k, kp, np, data: d, qm }
+        Self::from_padded(d, n, k, kp, qm)
+    }
+
+    fn from_padded(data: Vec<i8>, n: usize, k: usize, kp: usize, qm: f32) -> Self {
+        let np = (n + 3) / 4 * 4;
+        #[allow(unused_mut)]
+        let mut b = PackedB { n, k, kp, np, data, qm, il: Vec::new(), il_group: 0, colsum: Vec::new() };
+        match isa() {
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+            Isa::Avx512Vnni512 => b.build_interleaved(16, 16, true),
+            #[cfg(target_arch = "aarch64")]
+            Isa::NeonDot => b.build_interleaved(4, 8, false),
+            _ => {}
+        }
+        b
+    }
+
+    /// Build the interleaved copy: `[col/G][k/4][col%G][k%4]`, columns padded to a multiple of `round`.
+    #[allow(dead_code)]
+    pub(crate) fn build_interleaved(&mut self, group: usize, round: usize, colsum: bool) {
+        let ncols = (self.n + round - 1) / round * round;
+        let kg = self.kp / 4;
+        let gbytes = group * 4;
+        let mut il = vec![0i8; ncols * self.kp];
+        let mut cs = vec![0i32; if colsum { ncols } else { 0 }];
+        for col in 0..self.n {
+            let row = &self.data[col * self.kp..(col + 1) * self.kp];
+            let base = (col / group) * kg * gbytes + (col % group) * 4;
+            for (kk, &v) in row.iter().enumerate() {
+                il[base + (kk / 4) * gbytes + (kk % 4)] = v;
+            }
+            if colsum {
+                cs[col] = row.iter().map(|&v| v as i32).sum();
+            }
+        }
+        self.il = il;
+        self.il_group = group;
+        self.colsum = cs;
     }
 
     /// Gather a subset of rows (output columns) into a new packed matrix.
@@ -50,7 +97,11 @@ impl PackedB {
             let r = r as usize;
             d[i * self.kp..(i + 1) * self.kp].copy_from_slice(&self.data[r * self.kp..(r + 1) * self.kp]);
         }
-        PackedB { n, k: self.k, kp: self.kp, np, data: d, qm: self.qm }
+        Self::from_padded(d, n, self.k, self.kp, self.qm)
+    }
+
+    pub fn duplicate(&self) -> PackedB {
+        Self::from_padded(self.data.clone(), self.n, self.k, self.kp, self.qm)
     }
 }
 
@@ -64,6 +115,9 @@ pub enum Isa {
     AvxVnni,
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     Avx512Vnni,
+    /// Full 512-bit kernel over the interleaved weight layout (fastest on AVX512-VNNI CPUs).
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    Avx512Vnni512,
     #[cfg(target_arch = "aarch64")]
     Neon,
     #[cfg(target_arch = "aarch64")]
@@ -75,8 +129,8 @@ pub enum Isa {
 pub fn detect_isa() -> Isa {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     {
-        if is_x86_feature_detected!("avx512vnni") && is_x86_feature_detected!("avx512vl") && is_x86_feature_detected!("avx2") {
-            return Isa::Avx512Vnni;
+        if is_x86_feature_detected!("avx512vnni") && is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f") {
+            return Isa::Avx512Vnni512;
         }
         if is_x86_feature_detected!("avxvnni") && is_x86_feature_detected!("avx2") {
             return Isa::AvxVnni;
@@ -109,19 +163,40 @@ pub fn isa() -> Isa {
     })
 }
 
+#[allow(unused_variables)]
+fn effective_isa(isa: Isa, b: &PackedB) -> Isa {
+    match isa {
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        Isa::Avx512Vnni512 if b.il_group != 16 => Isa::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        Isa::NeonDot if b.il_group != 4 => Isa::Neon,
+        other => other,
+    }
+}
+
+fn needs_u8(isa: Isa) -> bool {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    if isa == Isa::Avx512Vnni512 {
+        return true;
+    }
+    let _ = isa;
+    false
+}
+
+/// Number of independent work units (output column blocks) for the parallel splitter.
+fn tile_units(isa: Isa, b: &PackedB) -> usize {
+    match isa {
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        Isa::Avx512Vnni512 => (b.n + 15) / 16,
+        #[cfg(target_arch = "aarch64")]
+        Isa::NeonDot => (b.n + 7) / 8,
+        _ => b.np / 4,
+    }
+}
+
 /// Quantise `m x k` f32 rows into int8 rows with stride `kp` (zero padded).
 pub fn quantize(a: &[f32], m: usize, k: usize, qm: f32, kp: usize, out: &mut Vec<i8>) {
-    out.clear();
-    out.resize(m * kp, 0);
-    const MAGIC: f32 = 12582912.0; // 1.5 * 2^23: add/sub rounds to nearest-even
-    for r in 0..m {
-        let src = &a[r * k..(r + 1) * k];
-        let dst = &mut out[r * kp..r * kp + k];
-        for (d, &x) in dst.iter_mut().zip(src) {
-            let y = (x * qm + MAGIC) - MAGIC;
-            *d = y.clamp(-127.0, 127.0) as i8;
-        }
-    }
+    fmath::quantize(a, m, k, qm, kp, out)
 }
 
 /// C[m][n] = (A_q . B_q^T) * (1 / (qa * qb)) + bias. `a` has row stride `b.kp`.
@@ -137,8 +212,14 @@ pub fn gemm_isa(isa: Isa, a: &[i8], m: usize, b: &PackedB, qa: f32, bias: Option
         return;
     }
     let scale = 1.0 / (qa * b.qm);
-    let tiles = b.np / 4;
+    // Interleaved kernels need a matching weight layout; otherwise use the portable kernel of the family.
+    let isa = effective_isa(isa, b);
+    let tiles = tile_units(isa, b);
     let work = m * b.np * b.kp;
+    // The 512-bit x86 kernel multiplies unsigned activations (a ^ 0x80 == a + 128) and removes
+    // the bias with an exact integer column-sum correction.
+    let au: Vec<u8> = if needs_u8(isa) { a[..m * b.kp].iter().map(|&v| (v as u8) ^ 0x80).collect() } else { Vec::new() };
+    let a_u8 = &au[..];
     #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
     if work >= (1 << 21) && tiles >= 8 {
         use rayon::prelude::*;
@@ -149,12 +230,12 @@ pub fn gemm_isa(isa: Isa, a: &[i8], m: usize, b: &PackedB, qa: f32, bias: Option
         ranges.into_par_iter().for_each(|(t0, t1)| {
             let ptr = ptr;
             // SAFETY: tile ranges write disjoint output columns.
-            unsafe { run(isa, a, m, b, scale, bias, ptr.0, t0, t1) };
+            unsafe { run(isa, a, a_u8, m, b, scale, bias, ptr.0, t0, t1) };
         });
         return;
     }
     let _ = work;
-    unsafe { run(isa, a, m, b, scale, bias, out.as_mut_ptr(), 0, tiles) };
+    unsafe { run(isa, a, a_u8, m, b, scale, bias, out.as_mut_ptr(), 0, tiles) };
 }
 
 #[derive(Clone, Copy)]
@@ -164,7 +245,8 @@ unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn run(isa: Isa, a: &[i8], m: usize, b: &PackedB, scale: f32, bias: Option<&[f32]>, out: *mut f32, t0: usize, t1: usize) {
+#[allow(unused_variables)]
+unsafe fn run(isa: Isa, a: &[i8], a_u8: &[u8], m: usize, b: &PackedB, scale: f32, bias: Option<&[f32]>, out: *mut f32, t0: usize, t1: usize) {
     match isa {
         Isa::Scalar => scalar::gemm(a, m, b, scale, bias, out, t0, t1),
         #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
@@ -173,10 +255,12 @@ unsafe fn run(isa: Isa, a: &[i8], m: usize, b: &PackedB, scale: f32, bias: Optio
         Isa::AvxVnni => x86::gemm_avxvnni(a, m, b, scale, bias, out, t0, t1),
         #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
         Isa::Avx512Vnni => x86::gemm_avx512vnni(a, m, b, scale, bias, out, t0, t1),
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        Isa::Avx512Vnni512 => x86::gemm_zmm(a_u8, m, b, scale, bias, out, t0, t1),
         #[cfg(target_arch = "aarch64")]
         Isa::Neon => neon::gemm(a, m, b, scale, bias, out, t0, t1),
         #[cfg(target_arch = "aarch64")]
-        Isa::NeonDot => neon::gemm_dot(a, m, b, scale, bias, out, t0, t1),
+        Isa::NeonDot => neon::gemm_dot_il(a, m, b, scale, bias, out, t0, t1),
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
         Isa::Simd128 => wasm::gemm(a, m, b, scale, bias, out, t0, t1),
     }
@@ -184,7 +268,8 @@ unsafe fn run(isa: Isa, a: &[i8], m: usize, b: &PackedB, scale: f32, bias: Optio
 
 // ---------------------------------------------------------------- f32 helpers
 
-#[inline]
+pub use fmath::{add_layer_norm, attend, fast_exp, log_softmax_rows, relu_inplace, ssru_gate};
+
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0f32; 8];
     let ca = a.chunks_exact(8);
@@ -268,6 +353,9 @@ mod tests {
             if is_x86_feature_detected!("avxvnni") && is_x86_feature_detected!("avx2") {
                 v.push(Isa::AvxVnni);
             }
+            if is_x86_feature_detected!("avx512vnni") && is_x86_feature_detected!("avx512vl") && is_x86_feature_detected!("avx2") {
+                v.push(Isa::Avx512Vnni);
+            }
         }
         v.dedup();
         v
@@ -301,6 +389,27 @@ mod tests {
                 gemm_isa(isa, &aq, m, &b, 100.0, Some(&bias), &mut got);
                 assert_eq!(got, reference, "isa {isa:?} m={m} n={n} k={k}");
             }
+        }
+    }
+
+    /// Runs the exact ARM tile loops (layout, 4x8 tiling, row/column tails) on any host by
+    /// substituting a software model of `SDOT Vd.4S, Vn.16B, Vm.4B[L]`.
+    #[test]
+    fn arm_sdot_tile_logic_matches_scalar() {
+        let mut seed = 5u64;
+        for &(m, n, k) in &[(1, 1, 5), (1, 8, 32), (2, 9, 100), (3, 17, 257), (4, 8, 32), (7, 31, 256), (9, 130, 1536), (13, 7, 33)] {
+            let bd: Vec<i8> = (0..n * k).map(|_| ((lcg(&mut seed) % 255) as i32 - 127) as i8).collect();
+            let mut b = PackedB::from_nk(&bd, n, k, 40.0);
+            b.build_interleaved(4, 8, false);
+            let af: Vec<f32> = (0..m * k).map(|_| (lcg(&mut seed) % 2000) as f32 / 1000.0 - 1.0).collect();
+            let mut aq = Vec::new();
+            quantize(&af, m, k, 100.0, b.kp, &mut aq);
+            let bias: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
+            let mut want = vec![0f32; m * n];
+            gemm_isa(Isa::Scalar, &aq, m, &b, 100.0, Some(&bias), &mut want);
+            let mut got = vec![f32::NAN; m * n];
+            unsafe { dot4::gemm::<dot4::Emulated>(&aq, m, &b, 1.0 / (100.0 * 40.0), Some(&bias), got.as_mut_ptr(), 0, (n + 7) / 8) };
+            assert_eq!(got, want, "m={m} n={n} k={k}");
         }
     }
 

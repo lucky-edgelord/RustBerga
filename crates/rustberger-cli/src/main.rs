@@ -83,6 +83,9 @@ fn main() {
     std::io::stdout().write_all(out.as_bytes()).unwrap();
     if stats {
         let words = input.split_whitespace().count();
+        let p = rustberger::prof::seconds();
+        let parts: Vec<String> = rustberger::prof::NAMES.iter().zip(p).map(|(n, s)| format!("{n} {s:.3}s")).collect();
+        eprintln!("cpu-seconds by stage (search includes decoder stages): {}", parts.join(", "));
         eprintln!("load {:.3}s  translate {:.3}s  ({} words, {:.1} words/s)", t_load.as_secs_f64(), t_tr.as_secs_f64(), words, words as f64 / t_tr.as_secs_f64());
     }
 }

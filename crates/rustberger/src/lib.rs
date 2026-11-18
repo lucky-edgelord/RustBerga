@@ -7,6 +7,7 @@ pub mod gpu;
 pub mod kernels;
 pub mod marian;
 pub mod model;
+pub mod prof;
 pub mod search;
 pub mod shortlist;
 pub mod spm;
@@ -90,6 +91,7 @@ impl Translator {
         let mut jobs: Vec<Job> = Vec::new();
         let mut chunks_per_sent = vec![0usize; sentences.len()];
         for (si, s) in sentences.iter().enumerate() {
+            let _t = prof::start(prof::TOKENIZE);
             let ids = self.spm.encode(s);
             if ids.is_empty() {
                 continue;

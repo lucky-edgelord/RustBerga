@@ -141,3 +141,59 @@ pub unsafe fn gemm_avxvnni(a: &[i8], m: usize, b: &PackedB, scale: f32, bias: Op
 pub unsafe fn gemm_avx512vnni(a: &[i8], m: usize, b: &PackedB, scale: f32, bias: Option<&[f32]>, out: *mut f32, t0: usize, t1: usize) {
     gemm_generic::<Avx512Vnni>(a, m, b, scale, bias, out, t0, t1)
 }
+
+// ------------------------------------------------------------------------------------------
+// 512-bit kernel over the interleaved layout (16 output columns per register).
+
+#[inline(always)]
+unsafe fn zmm_tile<const R: usize>(au: *const u8, kp: usize, bp: *const i8, kg: usize, row0: usize, n: usize, col0: usize, ncol: usize, cs: __m512i, scale: f32, bias: Option<&[f32]>, out: *mut f32) {
+    let mut acc = [_mm512_setzero_si512(); R];
+    let rows: [*const u8; R] = core::array::from_fn(|r| au.add((row0 + r) * kp));
+    for g in 0..kg {
+        let bv = _mm512_loadu_si512(bp.add(g * 64) as *const _);
+        for r in 0..R {
+            let a4 = _mm512_set1_epi32((rows[r].add(g * 4) as *const i32).read_unaligned());
+            acc[r] = _mm512_dpbusd_epi32(acc[r], a4, bv);
+        }
+    }
+    let mask: __mmask16 = if ncol >= 16 { 0xFFFF } else { ((1u32 << ncol) - 1) as u16 };
+    let corr = _mm512_slli_epi32(cs, 7); // 128 * column sum
+    let sc = _mm512_set1_ps(scale);
+    let bv = match bias {
+        Some(b) => _mm512_maskz_loadu_ps(mask, b.as_ptr().add(col0)),
+        None => _mm512_setzero_ps(),
+    };
+    for r in 0..R {
+        let v = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(acc[r], corr)), sc), bv);
+        _mm512_mask_storeu_ps(out.add((row0 + r) * n + col0), mask, v);
+    }
+}
+
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+pub unsafe fn gemm_zmm(au: &[u8], m: usize, b: &PackedB, scale: f32, bias: Option<&[f32]>, out: *mut f32, g0: usize, g1: usize) {
+    let kp = b.kp;
+    let kg = kp / 4;
+    let aptr = au.as_ptr();
+    for g in g0..g1 {
+        let col0 = g * 16;
+        let ncol = (b.n - col0).min(16);
+        let bp = b.il.as_ptr().add(g * kg * 64);
+        let cs = _mm512_loadu_si512(b.colsum.as_ptr().add(col0) as *const _);
+        let mut i = 0;
+        while i + 8 <= m {
+            zmm_tile::<8>(aptr, kp, bp, kg, i, b.n, col0, ncol, cs, scale, bias, out);
+            i += 8;
+        }
+        if i + 4 <= m {
+            zmm_tile::<4>(aptr, kp, bp, kg, i, b.n, col0, ncol, cs, scale, bias, out);
+            i += 4;
+        }
+        if i + 2 <= m {
+            zmm_tile::<2>(aptr, kp, bp, kg, i, b.n, col0, ncol, cs, scale, bias, out);
+            i += 2;
+        }
+        if i < m {
+            zmm_tile::<1>(aptr, kp, bp, kg, i, b.n, col0, ncol, cs, scale, bias, out);
+        }
+    }
+}
