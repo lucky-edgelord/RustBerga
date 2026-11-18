@@ -9,9 +9,12 @@ license.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 rayon = { version = "1", optional = true }
+wgpu = { version = "30", optional = true, default-features = false, features = ["wgsl", "vulkan", "metal", "dx12", "gles"] }
+pollster = { version = "1", optional = true }
 
 [features]
 default = ["parallel"]
 parallel = ["dep:rayon"]
+gpu = ["dep:wgpu", "dep:pollster"]
 
 [dev-dependencies]

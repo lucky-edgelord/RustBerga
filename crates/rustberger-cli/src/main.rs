@@ -9,7 +9,7 @@ use rustberger::Translator;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: rustberger --model-config-paths <config.yml> [--cpu-threads N] [--stats]\n       rustberger --model <model.bin> --vocab <vocab.spm> [--shortlist <lex.bin>] [--beam N] [--cpu-threads N] [--stats]"
+        "usage: rustberger --model-config-paths <config.yml> [--cpu-threads N] [--stats] [--gpu]\n       rustberger --model <model.bin> --vocab <vocab.spm> [--shortlist <lex.bin>] [--beam N] [--cpu-threads N] [--stats]"
     );
     std::process::exit(2)
 }
@@ -18,6 +18,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mut cfg, mut model, mut vocab, mut sl) = (None, None, None, None);
     let (mut threads, mut beam, mut stats) = (None, None, false);
+    let mut gpu = false;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].clone();
@@ -33,6 +34,7 @@ fn main() {
             "--cpu-threads" => threads = Some(val().parse::<usize>().unwrap_or_else(|_| usage())),
             "--beam" => beam = Some(val().parse::<usize>().unwrap_or_else(|_| usage())),
             "--stats" => stats = true,
+            "--gpu" => gpu = true,
             _ => usage(),
         }
         i += 1;
@@ -41,6 +43,15 @@ fn main() {
         if t > 0 {
             rayon::ThreadPoolBuilder::new().num_threads(t).build_global().ok();
         }
+    }
+    if gpu {
+        #[cfg(feature = "gpu")]
+        match rustberger::gpu::enable() {
+            Ok(info) => eprintln!("gpu: {info}"),
+            Err(e) => eprintln!("gpu: {e}; continuing on CPU"),
+        }
+        #[cfg(not(feature = "gpu"))]
+        eprintln!("gpu: this binary was built without the `gpu` feature; continuing on CPU");
     }
     let t0 = Instant::now();
     let loaded = match (&cfg, &model, &vocab) {

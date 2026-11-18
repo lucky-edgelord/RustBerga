@@ -12,12 +12,22 @@ pub struct Linear {
     pub w: PackedB,
     pub qa: f32,
     pub bias: Option<Vec<f32>>,
+    #[cfg(feature = "gpu")]
+    gpu_w: std::sync::OnceLock<crate::gpu::GpuWeights>,
 }
 
 impl Linear {
     /// `x` is `m x w.k` f32; result is `m x w.n`.
     pub fn apply(&self, x: &[f32], m: usize, scratch: &mut Vec<i8>, out: &mut Vec<f32>) {
         kernels::quantize(x, m, self.w.k, self.qa, self.w.kp, scratch);
+        #[cfg(feature = "gpu")]
+        if m >= crate::gpu::MIN_ROWS {
+            if let Some(g) = crate::gpu::get() {
+                let gw = self.gpu_w.get_or_init(|| g.upload(&self.w));
+                *out = g.gemm(scratch, m, gw, 1.0 / (self.qa * self.w.qm), self.bias.as_deref());
+                return;
+            }
+        }
         out.clear();
         out.resize(m * self.w.n, 0.0);
         kernels::gemm(scratch, m, &self.w, self.qa, self.bias.as_deref(), out);
@@ -120,7 +130,7 @@ impl Loader {
             Some(b) => Some(self.vec(b)?),
             None => None,
         };
-        Ok(Linear { w: PackedB::from_nk(data, n, k, qm), qa, bias })
+        Ok(Linear { w: PackedB::from_nk(data, n, k, qm), qa, bias, #[cfg(feature = "gpu")] gpu_w: std::sync::OnceLock::new() })
     }
     fn ln(&self, prefix: &str) -> Result<Ln> {
         Ok(Ln { g: self.vec(&format!("{prefix}_ln_scale"))?, b: self.vec(&format!("{prefix}_ln_bias"))? })
